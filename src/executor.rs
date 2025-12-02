@@ -96,10 +96,6 @@ impl<S: ServicesBundle, O: Oracle> Executor<S, O> {
         order: &Order,
         prices: &OraclePrices,
     ) -> Result<(), String> {
-        // // 1) Pre-margin (обрати внимание: без &State)
-        // services
-        //     .margin()
-        //     .pre_check_increase(market, order, prices)?;
 
         let key = PositionKey {
             account: order.account,
@@ -313,6 +309,13 @@ mod tests {
         market.long_asset = long_asset;
         market.short_asset = short_asset;
 
+        let m_before1 = executor
+            .state
+            .markets
+            .get(&market_id)
+            .unwrap()
+            .clone();
+
         // STEP 1: first short increase at t1
         // open short for 20k notional
         let mut order1 = Order {
@@ -333,6 +336,86 @@ mod tests {
         executor
             .execute_order(t1, order1_id)
             .expect("first execute_order must succeed");
+
+        // Assertions after step 1 
+
+        // Order must be removed
+        assert!(
+            executor.state.orders.get(order1_id).is_none(),
+            "order1 must be removed after execution"
+        );
+
+        // Position updated
+
+        let pos_key = PositionKey {
+            account,
+            market_id,
+            collateral_token,
+            side: Side::Short,
+        };
+        let pos_after1 = executor
+            .state
+            .positions
+            .get(&pos_key)
+            .expect("position must exist after first execution");
+
+        // Size in USD should equal 20k (from 0)
+        assert_eq!(
+            pos_after1.size_usd, 20_000,
+            "after first increase, size_usd should be 20k"
+        );
+        // Some tokens must be opened
+        assert!(
+            pos_after1.size_tokens > 0,
+            "short position must have non-zero size_tokens"
+        );
+
+        // Market OI: short side increases by 20k, long remains unchanged.
+        let m_after1 = executor.state.markets.get(&market_id).unwrap();
+        assert_eq!(
+            m_after1.oi_long_usd, m_before1.oi_long_usd,
+            "long OI must not change for short increase"
+        );
+        assert_eq!(
+            m_after1.oi_short_usd,
+            m_before1.oi_short_usd + 20_000,
+        );
         
+         // Funding / borrowing indices updated to t1.
+        assert_eq!(
+            m_after1.funding.last_updated_at, t1,
+            "funding.last_updated_at must be updated to t1"
+        );
+        assert_eq!(
+            m_after1.borrowing.last_updated_at, t1,
+            "borrowing.last_updated_at must be updated to t1"
+        );
+
+        // Position snapshots must match current funding / borrowing indices for its side.
+        assert_eq!(
+            pos_after1.funding_index,
+            m_after1.funding.cumulative_index_short,
+            "short position funding_index must match market short index after step 1"
+        );
+        assert_eq!(
+            pos_after1.borrowing_index,
+            m_after1.borrowing.cumulative_factor,
+            "position borrowing_index must match market borrowing factor after step 1"
+        );
+
+        assert!(
+            pos_after1.collateral_amount > 0,
+            "collateral must remain positive after first step"
+        );
+
+        // Pool must receive position fee tokens for the collateral asset.
+        let fee_pool_after1 = executor
+            .state
+            .pool_balances
+            .get_fee_for_pool(market_id, collateral_token);
+        assert!(
+            fee_pool_after1 > 0,
+            "after first step, pool must have some fee tokens from position fees"
+        );
     }
 }

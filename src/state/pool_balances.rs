@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, hash::Hash};
 
 use crate::types::{AssetId, MarketId, TokenAmount};
 
@@ -9,19 +9,18 @@ use crate::types::{AssetId, MarketId, TokenAmount};
 ///  - short_token (e.g. USDC, USDT, etc.)
 #[derive(Debug, Default, Clone)]
 pub struct PoolBalances {
-    /// (market_id, asset_id) -> token amount in the pool.
-    balances: HashMap<(MarketId, AssetId), TokenAmount>,
+    /// Total liquidity in tokens for each (market, asset).
+    pub liquidity: HashMap<(MarketId, AssetId), TokenAmount>,
+    /// Accumulated trading / borrowing fees for each (market, asset).
+    pub fees: HashMap<(MarketId, AssetId), TokenAmount>,
 }
 
 impl PoolBalances {
     pub fn new() -> Self {
         Self {
-            balances: HashMap::new(),
+            liquidity: HashMap::new(),
+            fees: HashMap::new(),
         }
-    }
-
-    fn entry_mut(&mut self, market_id: MarketId, asset: AssetId) -> &mut TokenAmount {
-        self.balances.entry((market_id, asset)).or_insert(0)
     }
 
     /// Add trading fees to the pool for a specific (market, asset).
@@ -30,8 +29,8 @@ impl PoolBalances {
             return;
         }
 
-        let bal = self.entry_mut(market_id, asset);
-        *bal = bal.saturating_add(amount);
+        let entry = self.fees.entry((market_id, asset)).or_insert(0);
+        *entry = entry.saturating_add(amount);
     }
 
     /// Add liquidity for a single asset (either long or short) to a market pool.
@@ -47,8 +46,8 @@ impl PoolBalances {
             return;
         }
 
-        let bal = self.entry_mut(market_id, asset);
-        *bal = bal.saturating_add(amount);
+        let entry = self.liquidity.entry((market_id, asset)).or_insert(0);
+        *entry = entry.saturating_add(amount);
     }
 
     /// Add liquidity for both sides of a 2-token pool (long + short) at once.
@@ -80,7 +79,7 @@ impl PoolBalances {
         }
 
         let key = (market_id, asset);
-        let bal = self.balances.entry(key).or_insert(0);
+        let bal = self.liquidity.entry(key).or_insert(0);
 
         if *bal < amount {
             return Err("insufficient_pool_liquidity".into());
@@ -106,7 +105,7 @@ impl PoolBalances {
 
     /// Read current pool balance for (market, asset) without modifying it.
     pub fn get_balance(&self, market_id: MarketId, asset: AssetId) -> TokenAmount {
-        self.balances.get(&(market_id, asset)).cloned().unwrap_or(0)
+        self.liquidity.get(&(market_id, asset)).cloned().unwrap_or(0)
     }
 
     /// Get both sides of a 2-token pool for a given market.
@@ -119,5 +118,9 @@ impl PoolBalances {
         let long_bal = self.get_balance(market_id, long_asset);
         let short_bal = self.get_balance(market_id, short_asset);
         (long_bal, short_bal)
+    }
+
+     pub fn get_fee_for_pool(&self, market_id: MarketId, asset: AssetId) -> TokenAmount {
+        *self.fees.get(&(market_id, asset)).unwrap_or(&0)
     }
 }
