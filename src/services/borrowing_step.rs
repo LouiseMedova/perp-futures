@@ -1,3 +1,5 @@
+use primitive_types::U256;
+
 use crate::services::BorrowingService;
 use crate::state::{MarketState, Position};
 use crate::types::Usd;
@@ -26,6 +28,6 @@ pub fn apply_borrowing_step<B: BorrowingService>(
 
     // Borrowing is expected to be a cost.
     BorrowingStep {
-        cost_usd: fee.max(0),
+        cost_usd: fee.max(U256::zero()),
     }
 }

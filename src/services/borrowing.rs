@@ -1,9 +1,45 @@
+use primitive_types::{U256, U512};
+
 use crate::state::{MarketState, PoolBalances, Position};
 use crate::types::{AssetId, MarketId, Timestamp, TokenAmount, Usd};
 
 /// Internal scale for borrowing index.
 /// Same idea as with funding: factor per 1 USD of position * SCALE.
-const BORROW_INDEX_SCALE: i128 = 1_000_000; // 1e6
+fn borrow_index_scale() -> U256 {
+    U256::exp10(18)
+}
+
+const SECONDS_PER_DAY: u64 = 86_400;
+
+/// 0.01% per day in basis points = 1 bps
+const BASE_RATE_PER_DAY_BPS: u64 = 1;
+/// 0.09% per day in basis points = 9 bps (so util=1 => 10 bps/day = 0.10%/day)
+const SLOPE_PER_DAY_BPS: u64 = 9;
+
+fn u512_to_u256_checked(x: U512) -> Result<U256, String> {
+    let be = x.to_big_endian();
+    if be[..32].iter().any(|&b| b != 0) {
+        return Err("mul_div_overflow".into());
+    }
+    Ok(U256::from_big_endian(&be[32..]))
+}
+
+fn mul_div_u256(a: U256, b: U256, den: U256) -> Result<U256, String> {
+    if den.is_zero() {
+        return Err("mul_div_den_zero".into());
+    }
+    let q = (U512::from(a) * U512::from(b)) / U512::from(den);
+    u512_to_u256_checked(q)
+}
+
+/// Convert "bps per day" into "fp per sec" in SCALE=1e18.
+/// rate_fp_per_sec = (bps/10_000 per day) / 86400 * SCALE
+fn bps_per_day_to_fp_per_sec(bps_per_day: u64) -> U256 {
+    let scale = borrow_index_scale();
+    let den = U256::from(10_000u64 * SECONDS_PER_DAY);
+    // floor is fine for MVP
+    mul_div_u256(U256::from(bps_per_day), scale, den).expect("bps_per_day_to_fp_per_sec overflow")
+}
 
 /// Result of borrowing settlement for a position.
 #[derive(Debug, Clone, Copy)]
@@ -35,18 +71,18 @@ pub struct BasicBorrowingService;
 
 impl BasicBorrowingService {
     /// Compute utilization as a fixed-point in [0, 1] * BORROW_INDEX_SCALE.
-    fn compute_utilization_fp(market: &MarketState) -> i128 {
-        let borrowed = (market.oi_long_usd + market.oi_short_usd).max(0);
-        let liquidity = market.liquidity_usd.max(0);
+    fn compute_utilization_fp(market: &MarketState) -> U256 {
+        let borrowed = market.oi_long_usd + market.oi_short_usd;
+        let liquidity = market.liquidity_usd;
 
-        if liquidity == 0 {
-            return 0;
+        if liquidity == U256::zero() {
+            return U256::zero();
         }
 
-        let ratio_fp = (borrowed as i128).saturating_mul(BORROW_INDEX_SCALE) / (liquidity as i128);
+        let ratio_fp = borrowed.saturating_mul(borrow_index_scale()) / liquidity;
 
         // Cap at 1.0 in FP
-        ratio_fp.min(BORROW_INDEX_SCALE)
+        ratio_fp.min(borrow_index_scale())
     }
 }
 
@@ -79,13 +115,15 @@ impl BorrowingService for BasicBorrowingService {
         //   - slope_fp: how fast rate grows with utilization.
         //
         // Units: index units per second (same scale: BORROW_INDEX_SCALE).
-        let base_rate_fp_per_sec: i128 = 5; // very small base rate (MVP)
-        let slope_fp_per_sec: i128 = 20; // how much rate increases with util
+        let base_rate_fp_per_sec = bps_per_day_to_fp_per_sec(BASE_RATE_PER_DAY_BPS); // ~1_157_407_407
+        let slope_fp_per_sec = bps_per_day_to_fp_per_sec(SLOPE_PER_DAY_BPS); // ~10_416_666_667
 
-        let rate_per_sec_fp = base_rate_fp_per_sec
-            .saturating_add(slope_fp_per_sec.saturating_mul(util_fp) / BORROW_INDEX_SCALE);
+        // rate_per_sec_fp = base + slope * util / SCALE
+        let slope_term =
+            mul_div_u256(slope_fp_per_sec, util_fp, borrow_index_scale()).unwrap_or(U256::zero());
+        let rate_per_sec_fp = base_rate_fp_per_sec.saturating_add(slope_term);
 
-        let delta_index_fp = rate_per_sec_fp.saturating_mul(dt as i128);
+        let delta_index_fp = rate_per_sec_fp.saturating_mul(U256::from(dt));
 
         borrowing.cumulative_factor = borrowing.cumulative_factor.saturating_add(delta_index_fp);
         borrowing.last_updated_at = now;
@@ -100,15 +138,15 @@ impl BorrowingService for BasicBorrowingService {
         let prev_idx = pos.borrowing_index;
 
         let delta_idx = current_idx - prev_idx;
-        if delta_idx <= 0 || pos.size_usd == 0 {
+        if delta_idx <= U256::zero() || pos.size_usd == U256::zero() {
             pos.borrowing_index = current_idx;
             return BorrowingDelta {
-                borrowing_fee_usd: 0,
+                borrowing_fee_usd: U256::zero(),
             };
         }
 
         // borrowing_fee = sizeUsd * deltaIndex / SCALE
-        let fee = (pos.size_usd as i128).saturating_mul(delta_idx) / BORROW_INDEX_SCALE;
+        let fee = pos.size_usd.saturating_mul(delta_idx) / borrow_index_scale();
 
         pos.borrowing_index = current_idx;
 
@@ -126,9 +164,53 @@ pub fn apply_borrowing_fees_to_pool(
     collateral_token: AssetId,
     borrowing_tokens: TokenAmount,
 ) {
-    if borrowing_tokens == 0 {
+    if borrowing_tokens.is_zero() {
         return;
     }
 
     pools.add_fee_to_pool(market_id, collateral_token, borrowing_tokens);
+}
+
+fn utilization_fp(market: &MarketState) -> U256 {
+    let borrowed = market.oi_long_usd.saturating_add(market.oi_short_usd);
+    let liquidity = market.liquidity_usd;
+    if liquidity.is_zero() {
+        return U256::zero();
+    }
+    let fp = borrowed.saturating_mul(borrow_index_scale()) / liquidity;
+    fp.min(borrow_index_scale())
+}
+
+/// Preview borrowing fee for the position if we advanced indices to `now`.
+pub fn preview_borrowing_fee_usd(
+    market: &MarketState,
+    pos: &Position,
+    now: Timestamp,
+) -> Result<U256, String> {
+    let last = market.borrowing.last_updated_at;
+    if last == 0 || now <= last {
+        return Ok(U256::zero());
+    }
+    let dt: u64 = now - last;
+    if dt == 0 {
+        return Ok(U256::zero());
+    }
+    let util = utilization_fp(market);
+    let base = bps_per_day_to_fp_per_sec(BASE_RATE_PER_DAY_BPS);
+    let slope = bps_per_day_to_fp_per_sec(SLOPE_PER_DAY_BPS);
+
+    // rate_per_sec_fp = base + slope * util / SCALE
+    let slope_term = mul_div_u256(slope, util, borrow_index_scale())?;
+    let rate_per_sec_fp = base.saturating_add(slope_term);
+
+    let delta_index_fp = rate_per_sec_fp.saturating_mul(U256::from(dt));
+    let current_idx = market.borrowing.cumulative_factor.saturating_add(delta_index_fp);
+
+    if current_idx <= pos.borrowing_index || pos.size_usd.is_zero() {
+        return Ok(U256::zero());
+    }
+
+    let delta_idx = current_idx - pos.borrowing_index;
+    // fee_usd = size_usd * delta_idx / SCALE
+    Ok(pos.size_usd.saturating_mul(delta_idx) / borrow_index_scale())
 }

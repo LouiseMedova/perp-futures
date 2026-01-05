@@ -1,11 +1,53 @@
 // src/types.rs
 use std::hash::Hash;
 
+use primitive_types::U256;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct SignedU256 {
+    pub is_negative: bool,
+    pub mag: U256,
+}
+
+impl SignedU256 {
+    pub fn zero() -> Self {
+        Self {
+            is_negative: false,
+            mag: U256::zero(),
+        }
+    }
+    pub fn pos(mag: U256) -> Self {
+        Self {
+            is_negative: false,
+            mag,
+        }
+    }
+    pub fn neg(mag: U256) -> Self {
+        Self {
+            is_negative: !mag.is_zero(),
+            mag,
+        } // -0 не допускаем
+    }
+    pub fn is_zero(&self) -> bool {
+        self.mag.is_zero()
+    }
+    pub fn negated(self) -> Self {
+        if self.mag.is_zero() {
+            self
+        } else {
+            Self {
+                is_negative: !self.is_negative,
+                mag: self.mag,
+            }
+        }
+    }
+}
+
 pub type Timestamp = u64;
 
-pub type Usd = i128;
+pub type Usd = U256;
 
-pub type TokenAmount = i128;
+pub type TokenAmount = U256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub struct MarketId(pub u32);

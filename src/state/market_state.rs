@@ -63,10 +63,10 @@ pub struct MarketState {
 
 #[derive(Clone, Debug, Default)]
 pub struct FundingState {
-    /// Cumulative funding index for longs (scaled in Usd, твой i128).
-    pub cumulative_index_long: Usd,
-    /// Cumulative funding index for shorts (на будущее).
-    pub cumulative_index_short: Usd,
+    /// Cumulative funding index for longs.
+    pub cumulative_index_long: SignedU256,
+    /// Cumulative funding index for shorts.
+    pub cumulative_index_short: SignedU256,
     /// Last time funding indices were updated.
     pub last_updated_at: Timestamp,
 }

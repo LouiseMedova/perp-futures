@@ -1,15 +1,37 @@
+use primitive_types::U256;
+
+use crate::math;
 use crate::state::{MarketState, Position};
-use crate::types::{Side, Timestamp, Usd};
+use crate::types::{Side, SignedU256, Timestamp};
+/// Funding index scale.
+/// Index is stored as: (funding USD per 1 USD of position) * SCALE.
+///
+/// With SCALE = 1e18 we can represent very small per-second rates without quantization.
+/// Example:
+///   DAILY_RATE_BPS = 1  -> 0.01% per day at persistent imbalance
+///   per_sec_rate ≈ 1e-4 / 86400 ≈ 1.157e-9
+///   fp_per_sec   ≈ 1.157e-9 * 1e18 ≈ 1.157e9 (fits i128 easily)
+fn funding_index_scale() -> U256 {
+    U256::exp10(18) // 1e18
+}
 
-/// Internal scale for funding index.
-/// Index is stored as "funding USD per 1 USD of position * SCALE".
-const FUNDING_INDEX_SCALE: i128 = 1_000_000; // 1e6
+/// Desired funding rate (MVP): 1 bp/day = 0.01% per day when imbalance persists.
+/// Increase to 5..20 bps/day if you want stronger incentives.
+const DAILY_RATE_BPS: i128 = 1; // 0.01% / day
 
+const SECONDS_PER_DAY: i128 = 86_400;
+const BPS_DENOM: i128 = 10_000;
+
+/// rate_fp_per_sec = SCALE * (DAILY_RATE_BPS / 10_000) / 86_400
+fn rate_fp_per_sec() -> U256 {
+    (funding_index_scale() / U256::from(SECONDS_PER_DAY)) * U256::from(DAILY_RATE_BPS)
+        / U256::from(BPS_DENOM)
+}
 /// Result of funding settlement for a single position.
 #[derive(Debug, Clone, Copy)]
 pub struct FundingDelta {
     /// Positive value means "user pays", negative — "user receives".
-    pub funding_fee_usd: Usd,
+    pub funding_fee_usd: SignedU256,
 }
 
 /// Funding service: responsible for
@@ -36,7 +58,7 @@ pub trait FundingService {
 #[derive(Default)]
 pub struct BasicFundingService;
 
-fn current_index_for_side(market: &MarketState, side: Side) -> i128 {
+fn current_index_for_side(market: &MarketState, side: Side) -> SignedU256 {
     match side {
         Side::Long => market.funding.cumulative_index_long,
         Side::Short => market.funding.cumulative_index_short,
@@ -62,18 +84,15 @@ impl FundingService for BasicFundingService {
         }
 
         // 2) Read current OI.
-        let long_oi = market.oi_long_usd.max(0);
-        let short_oi = market.oi_short_usd.max(0);
+        let long_oi = market.oi_long_usd;
+        let short_oi = market.oi_short_usd;
         let total_oi = long_oi + short_oi;
 
         // If there is no open interest at all, funding does not move.
-        if total_oi == 0 {
+        if total_oi.is_zero() {
             funding.last_updated_at = now;
             return;
         }
-
-        // >0 => long-heavy, <0 => short-heavy
-        let imbalance = long_oi - short_oi;
 
         // 3) Very simple rule for MVP:
         //
@@ -81,27 +100,29 @@ impl FundingService for BasicFundingService {
         //    - If short-heavy → shorts pay longs.
         //
         // rate_abs_fp is "index units per second", in FUNDING_INDEX_SCALE.
-        //
-        // Example: 1e-8 per second ≈ 0.0000864 per day (0.00864%).
-        // TODO: can tune this later.
-        let rate_abs_fp_per_sec: i128 = 10; // extremely small for MVP
 
-        let delta_index_fp = rate_abs_fp_per_sec * dt as i128;
-
-        if imbalance > 0 {
-            // Long-heavy → longs pay, shorts receive.
-            funding.cumulative_index_long =
-                funding.cumulative_index_long.saturating_add(delta_index_fp);
-            funding.cumulative_index_short = funding
-                .cumulative_index_short
-                .saturating_sub(delta_index_fp);
-        } else if imbalance < 0 {
-            // Short-heavy → shorts pay, longs receive.
-            funding.cumulative_index_long =
-                funding.cumulative_index_long.saturating_sub(delta_index_fp);
-            funding.cumulative_index_short = funding
-                .cumulative_index_short
-                .saturating_add(delta_index_fp);
+        let delta_index_fp = rate_fp_per_sec().saturating_mul(U256::from(dt));
+        if long_oi > short_oi {
+            // Long-heavy → longs pay (their index increases), shorts receive (their index decreases)
+            funding.cumulative_index_long = math::signed_add(
+                funding.cumulative_index_long,
+                SignedU256::pos(delta_index_fp),
+            );
+            funding.cumulative_index_short = math::signed_sub(
+                funding.cumulative_index_short,
+                SignedU256::pos(delta_index_fp),
+            );
+        } else {
+            // Short-heavy → shorts pay, longs receive
+            // Short-heavy: shorts pay
+            funding.cumulative_index_long = math::signed_sub(
+                funding.cumulative_index_long,
+                SignedU256::pos(delta_index_fp),
+            );
+            funding.cumulative_index_short = math::signed_add(
+                funding.cumulative_index_short,
+                SignedU256::pos(delta_index_fp),
+            );
         }
 
         funding.last_updated_at = now;
@@ -112,13 +133,15 @@ impl FundingService for BasicFundingService {
         let current_idx = current_index_for_side(market, pos.key.side);
         let prev_idx = pos.funding_index;
 
-        let delta_idx = current_idx - prev_idx;
-        if delta_idx == 0 || pos.size_usd == 0 {
-            // Nothing to settle.
-            pos.funding_index = current_idx;
-            return FundingDelta { funding_fee_usd: 0 };
-        }
+        // delta_idx = current - prev (signed)
+        let delta_idx = math::signed_sub(current_idx, prev_idx);
+        pos.funding_index = current_idx;
 
+        if delta_idx.is_zero() || pos.size_usd.is_zero() {
+            return FundingDelta {
+                funding_fee_usd: SignedU256::zero(),
+            };
+        }
         // 2) funding_fee_usd = sizeUsd * deltaIndex / SCALE
         //
         // Convention:
@@ -127,13 +150,92 @@ impl FundingService for BasicFundingService {
         //
         // Since we made payers' index go UP, receivers' index go DOWN,
         // the formula below automatically gives the right sign:
-        let fee = (pos.size_usd as i128).saturating_mul(delta_idx) / FUNDING_INDEX_SCALE;
+        // fee_mag = size_usd * abs(delta_idx) / SCALE
+        let abs_idx = math::signed_abs(delta_idx);
+        let scale = funding_index_scale();
 
-        // 3) Update position snapshot to the latest index.
-        pos.funding_index = current_idx;
+        let fee_mag = match pos.size_usd.checked_mul(abs_idx) {
+            Some(prod) => prod / scale, // floor
+            None => U256::MAX,          // MVP fallback
+        };
+
+        // sign of fee == sign of delta_idx
+        let fee = if delta_idx.is_negative {
+            SignedU256::neg(fee_mag) // user receives
+        } else {
+            SignedU256::pos(fee_mag) // user pays
+        };
 
         FundingDelta {
             funding_fee_usd: fee,
         }
     }
+}
+
+/// Preview funding fee for the position if we advanced indices to `now`.
+/// Returns SignedU256:
+///   + => user pays,
+///   - => user receives.
+pub fn preview_funding_fee_usd(
+    market: &MarketState,
+    pos: &Position,
+    now: Timestamp,
+) -> Result<SignedU256, String> {
+    let last = market.funding.last_updated_at;
+    if last == 0 || now <= last {
+        return Ok(SignedU256::zero());
+    }
+    let dt: u64 = now - last;
+    if dt == 0 {
+        return Ok(SignedU256::zero());
+    }
+
+    let long_oi = market.oi_long_usd;
+    let short_oi = market.oi_short_usd;
+    if long_oi.is_zero() && short_oi.is_zero() {
+        return Ok(SignedU256::zero());
+    }
+
+    let delta_index_fp = rate_fp_per_sec().saturating_mul(U256::from(dt));
+
+    // Compute hypothetical indices after update (same rule as FundingService)
+    let mut idx_long = market.funding.cumulative_index_long;
+    let mut idx_short = market.funding.cumulative_index_short;
+
+    if long_oi > short_oi {
+        // long-heavy: longs pay (index up), shorts receive (index down)
+        idx_long = math::signed_add(idx_long, SignedU256::pos(delta_index_fp));
+        idx_short = math::signed_sub(idx_short, SignedU256::pos(delta_index_fp));
+    } else if short_oi > long_oi {
+        // short-heavy: shorts pay, longs receive
+        idx_long = math::signed_sub(idx_long, SignedU256::pos(delta_index_fp));
+        idx_short = math::signed_add(idx_short, SignedU256::pos(delta_index_fp));
+    } else {
+        // balanced: no move
+        return Ok(SignedU256::zero());
+    }
+
+    let current_idx = match pos.key.side {
+        Side::Long => idx_long,
+        Side::Short => idx_short,
+    };
+    let prev_idx = pos.funding_index;
+    let delta_idx = math::signed_sub(current_idx, prev_idx);
+    if delta_idx.is_zero() || pos.size_usd.is_zero() {
+        return Ok(SignedU256::zero());
+    }
+
+    let abs_idx = math::signed_abs(delta_idx);
+    let fee_mag = pos.size_usd
+        .checked_mul(abs_idx)
+        .ok_or("funding_fee_mul_overflow")?
+        / funding_index_scale();
+
+    Ok(if fee_mag.is_zero() {
+        SignedU256::zero()
+    } else if delta_idx.is_negative {
+        SignedU256::neg(fee_mag) // user receives
+    } else {
+        SignedU256::pos(fee_mag) // user pays
+    })
 }

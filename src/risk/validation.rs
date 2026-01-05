@@ -1,3 +1,5 @@
+use primitive_types::U256;
+
 use crate::risk::RiskCfg;
 use crate::state::Position;
 use crate::types::{OraclePrices, Order};
@@ -16,22 +18,22 @@ pub fn precheck_decrease_and_withdraw(
     risk: RiskCfg,
 ) -> Result<(Usd, TokenAmount, bool), String> {
     // Basic sanity checks (user-level + invariants).
-    if pos.size_usd <= 0 || pos.size_tokens <= 0 {
+    if pos.size_usd.is_zero() || pos.size_tokens.is_zero() {
         return Err("position_empty_or_corrupted".into());
     }
-    if pos.collateral_amount < 0 {
+    if pos.collateral_amount.is_zero() {
         return Err("position_collateral_negative".into());
     }
-    if prices.collateral_price_min <= 0 {
+    if prices.collateral_price_min.is_zero() {
         return Err("invalid_collateral_price_min".into());
     }
-    if risk.factor_scale <= 0 {
+    if risk.factor_scale.is_zero() {
         return Err("invalid_factor_scale".into());
     }
 
     // 1) Normalize requested size delta.
     let mut size_delta_usd = order.size_delta_usd;
-    if size_delta_usd <= 0 {
+    if size_delta_usd.is_zero() {
         return Err("size_delta_usd_must_be_positive".into());
     }
     if size_delta_usd > pos.size_usd {
@@ -45,11 +47,9 @@ pub fn precheck_decrease_and_withdraw(
     // 3) Normalize withdraw request:
     // - on full close: force withdraw=0
     // - on partial close: allow but must be guarded
-    if order.withdraw_collateral_amount < 0 {
-        return Err("withdraw_collateral_amount_must_be_non_negative".into());
-    }
+
     let mut withdraw_tokens: TokenAmount = if is_full_close {
-        0
+        U256::zero()
     } else {
         order.withdraw_collateral_amount
     };
@@ -66,17 +66,17 @@ pub fn precheck_decrease_and_withdraw(
         .checked_sub(size_delta_usd)
         .expect("size_delta_usd clamped to <= pos.size_usd");
 
-    if next_size_usd != 0 && next_size_usd < risk.min_position_size_usd {
+    if !next_size_usd.is_zero() && next_size_usd < risk.min_position_size_usd {
         size_delta_usd = pos.size_usd;
-        withdraw_tokens = 0;
+        withdraw_tokens = U256::zero();
         is_full_close = true;
-        next_size_usd = 0;
+        next_size_usd = U256::zero();
     }
 
     // 5) Conservative pre-check for partial close.
     // If unsafe with withdraw -> try withdraw=0.
     // If still unsafe -> force full close.
-    if next_size_usd != 0 {
+    if !next_size_usd.is_zero() {
         let ok_with_withdraw = will_position_collateral_be_sufficient_pre(
             next_size_usd,
             pos.collateral_amount,
@@ -86,7 +86,7 @@ pub fn precheck_decrease_and_withdraw(
         );
 
         if !ok_with_withdraw {
-            withdraw_tokens = 0;
+            withdraw_tokens = U256::zero();
 
             let ok_without_withdraw = will_position_collateral_be_sufficient_pre(
                 next_size_usd,
@@ -98,13 +98,13 @@ pub fn precheck_decrease_and_withdraw(
 
             if !ok_without_withdraw {
                 size_delta_usd = pos.size_usd;
-                withdraw_tokens = 0;
+                withdraw_tokens = U256::zero();
                 is_full_close = true;
-                next_size_usd = 0;
+                next_size_usd = U256::zero();
             }
         }
     } else {
-        withdraw_tokens = 0;
+        withdraw_tokens = U256::zero();
         is_full_close = true;
     }
 
@@ -133,7 +133,7 @@ pub fn will_position_collateral_be_sufficient_pre(
     }
 
     // Invariant: oracle must provide positive collateral_price_min.
-    if prices.collateral_price_min <= 0 {
+    if prices.collateral_price_min.is_zero() {
         panic!("oracle invariant violated: collateral_price_min <= 0");
     }
 
@@ -167,14 +167,8 @@ pub fn postcheck_remaining_position(
     prices: &OraclePrices,
     risk: RiskCfg,
 ) -> Result<(), String> {
-    if pos_after.size_usd == 0 {
+    if pos_after.size_usd.is_zero() {
         return Ok(()); // closed is always fine
-    }
-    if pos_after.size_usd < 0 || pos_after.size_tokens < 0 || pos_after.collateral_amount < 0 {
-        return Err("position_negative_values_after_settlement".into());
-    }
-    if prices.collateral_price_min <= 0 {
-        return Err("invalid_collateral_price_min".into());
     }
 
     let remaining_collateral_usd = pos_after

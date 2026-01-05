@@ -1,3 +1,5 @@
+use primitive_types::U256;
+
 use crate::services::BorrowingService;
 use crate::services::FundingService;
 use crate::services::borrowing_step::{BorrowingStep, apply_borrowing_step};
@@ -53,15 +55,15 @@ where
     let borrowing_step = apply_borrowing_step(borrowing_svc, market, pos);
 
     // Convert borrowing from USD to collateral tokens (for pool yield).
-    let borrowing_tokens: TokenAmount = if prices.collateral_price_min > 0 {
+    let borrowing_tokens: TokenAmount = if prices.collateral_price_min > U256::zero() {
         borrowing_step.cost_usd / prices.collateral_price_min
     } else {
-        0
+        U256::zero()
     };
 
     // 3) Trading fees (position + liquidation).
     let trading_fees =
-        fees_svc.compute_fees(pos, order, prices, balance_was_improved, size_delta_usd);
+        fees_svc.compute_fees(pos, order, prices, balance_was_improved, size_delta_usd)?;
 
     let funding_usd = funding_step.cost_usd;
     let borrowing_usd = borrowing_step.cost_usd;
@@ -89,7 +91,7 @@ pub fn apply_step_costs_to_position(
     prices: &OraclePrices,
     step_costs: &StepCosts,
 ) -> Result<(), String> {
-    if prices.collateral_price_min <= 0 {
+    if prices.collateral_price_min <= U256::zero() {
         return Err("invalid_collateral_price_min".into());
     }
 

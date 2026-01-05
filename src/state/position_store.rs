@@ -3,7 +3,9 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
-use crate::types::{AccountId, AssetId, MarketId, Side, Timestamp, TokenAmount, Usd};
+use primitive_types::U256;
+
+use crate::types::{AccountId, AssetId, MarketId, Side, SignedU256, Timestamp, TokenAmount, Usd};
 
 /// Ключ позиции: уникально определяет позицию пользователя.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -24,11 +26,11 @@ pub struct Position {
 
     pub collateral_amount: TokenAmount,
 
-    pub pending_impact_tokens: TokenAmount,
+    pub pending_impact_tokens: SignedU256,
 
-    pub funding_index: i128,
+    pub funding_index: SignedU256,
 
-    pub borrowing_index: i128,
+    pub borrowing_index: U256,
 
     pub opened_at: Timestamp,
 

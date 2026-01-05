@@ -1,5 +1,7 @@
 use std::{collections::HashMap, hash::Hash};
 
+use primitive_types::U256;
+
 use crate::types::{AssetId, MarketId, TokenAmount};
 
 /// Simple pool balances storage.
@@ -24,20 +26,23 @@ impl PoolBalances {
     }
 
     pub fn add_to_pool(&mut self, market_id: MarketId, asset: AssetId, amount: TokenAmount) {
-        if amount <= 0 {
+        if amount <= U256::zero() {
             return;
         }
-        let entry = self.liquidity.entry((market_id, asset)).or_insert(0);
+        let entry = self
+            .liquidity
+            .entry((market_id, asset))
+            .or_insert(U256::zero());
         *entry = entry.saturating_add(amount);
     }
 
     /// Add trading fees to the pool for a specific (market, asset).
     pub fn add_fee_to_pool(&mut self, market_id: MarketId, asset: AssetId, amount: TokenAmount) {
-        if amount == 0 {
+        if amount == U256::zero() {
             return;
         }
 
-        let entry = self.fees.entry((market_id, asset)).or_insert(0);
+        let entry = self.fees.entry((market_id, asset)).or_insert(U256::zero());
         *entry = entry.saturating_add(amount);
     }
 
@@ -50,11 +55,14 @@ impl PoolBalances {
     ///
     /// For MVP we just bump the raw pool balance.
     pub fn add_liquidity(&mut self, market_id: MarketId, asset: AssetId, amount: TokenAmount) {
-        if amount == 0 {
+        if amount == U256::zero() {
             return;
         }
 
-        let entry = self.liquidity.entry((market_id, asset)).or_insert(0);
+        let entry = self
+            .liquidity
+            .entry((market_id, asset))
+            .or_insert(U256::zero());
         *entry = entry.saturating_add(amount);
     }
 
@@ -67,10 +75,10 @@ impl PoolBalances {
         short_asset: AssetId,
         short_amount: TokenAmount,
     ) {
-        if long_amount > 0 {
+        if long_amount > U256::zero() {
             self.add_liquidity(market_id, long_asset, long_amount);
         }
-        if short_amount > 0 {
+        if short_amount > U256::zero() {
             self.add_liquidity(market_id, short_asset, short_amount);
         }
     }
@@ -82,12 +90,12 @@ impl PoolBalances {
         asset: AssetId,
         amount: TokenAmount,
     ) -> Result<TokenAmount, String> {
-        if amount == 0 {
-            return Ok(0);
+        if amount == U256::zero() {
+            return Ok(U256::zero());
         }
 
         let key = (market_id, asset);
-        let bal = self.liquidity.entry(key).or_insert(0);
+        let bal = self.liquidity.entry(key).or_insert(U256::zero());
 
         if *bal < amount {
             return Err("insufficient_pool_liquidity".into());
@@ -116,7 +124,7 @@ impl PoolBalances {
         self.liquidity
             .get(&(market_id, asset))
             .cloned()
-            .unwrap_or(0)
+            .unwrap_or(U256::zero())
     }
 
     /// Get both sides of a 2-token pool for a given market.
@@ -132,6 +140,6 @@ impl PoolBalances {
     }
 
     pub fn get_fee_for_pool(&self, market_id: MarketId, asset: AssetId) -> TokenAmount {
-        *self.fees.get(&(market_id, asset)).unwrap_or(&0)
+        *self.fees.get(&(market_id, asset)).unwrap_or(&U256::zero())
     }
 }
