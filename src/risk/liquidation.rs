@@ -6,7 +6,7 @@ use crate::math::rounding::{Rounding, div_round};
 use crate::risk::RiskCfg;
 use crate::services::{borrowing, funding};
 use crate::state::{MarketState, Position};
-use crate::types::{OraclePrices, Side, SignedU256, Timestamp, Usd};
+use crate::types::{OraclePrices, Side, SignedU256, Timestamp};
 
 /// Fee config for liquidation preview.
 #[derive(Clone, Copy, Debug)]

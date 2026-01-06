@@ -1,14 +1,8 @@
-// src/state/order_store.rs
-
 use std::collections::HashMap;
 
 use crate::types::{Order, OrderId};
 
-/// Хранилище pending-ордеров.
-/// Ответственно только за:
-/// - выдачу уникального OrderId,
-/// - хранение/удаление ордеров по id.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct OrderStore {
     orders: HashMap<OrderId, Order>,
     next_id: u64,

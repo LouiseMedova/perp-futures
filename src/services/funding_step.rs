@@ -5,7 +5,7 @@ use primitive_types::U256;
 use crate::math;
 use crate::services::FundingService;
 use crate::state::{Claimables, MarketState, Position};
-use crate::types::{OraclePrices, SignedU256, TokenAmount, Usd};
+use crate::types::{OraclePrices, TokenAmount};
 /// Result of applying funding for a single position on a single step.
 #[derive(Debug, Clone, Copy)]
 pub struct FundingStep {

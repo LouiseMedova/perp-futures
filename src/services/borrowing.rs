@@ -66,7 +66,7 @@ pub trait BorrowingService {
 /// - utilization ≈ (oi_long + oi_short) / liquidity
 /// - rate is a simple linear function of utilization:
 ///     rate_per_sec = base_rate + slope * utilization
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct BasicBorrowingService;
 
 impl BasicBorrowingService {

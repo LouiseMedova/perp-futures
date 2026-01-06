@@ -30,7 +30,6 @@ pub fn total_position_pnl_usd(pos: &Position, prices: &OraclePrices) -> Result<S
         .ok_or("pnl_value_overflow")?;
 
     let entry = pos.size_usd;
-
     let pnl = match pos.key.side {
         Side::Long => {
             // pnl = value - entry

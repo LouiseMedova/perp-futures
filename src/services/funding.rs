@@ -55,7 +55,7 @@ pub trait FundingService {
 ///     * If longs > shorts → longs pay a fixed rate to shorts.
 ///     * If shorts > longs → shorts pay a fixed rate to longs.
 /// - Rate depends on imbalance **sign**, not magnitude (MVP).
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct BasicFundingService;
 
 fn current_index_for_side(market: &MarketState, side: Side) -> SignedU256 {

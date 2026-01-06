@@ -6,7 +6,7 @@ pub trait ImpactPoolService {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct BasicImpactPoolService;
 
 impl ImpactPoolService for BasicImpactPoolService {}

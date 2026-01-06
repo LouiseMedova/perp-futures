@@ -3,10 +3,13 @@ use primitive_types::U256;
 use crate::math;
 use crate::oracle::Oracle;
 use crate::risk;
+use crate::risk::{
+    RiskCfg, liquidation,
+    liquidation::{LiquidationFeeCfg, LiquidationPreview},
+};
 use crate::services::borrowing::apply_borrowing_fees_to_pool;
 use crate::services::price_impact::ImpactRebalanceConfig;
 use crate::services::pricing::ExecutionPriceParams;
-use crate::risk::{RiskCfg, liquidation, liquidation::{LiquidationFeeCfg, LiquidationPreview}};
 use crate::services::step_costs::{apply_step_costs_to_position, compute_step_costs};
 use crate::services::*;
 use crate::state::{
@@ -15,6 +18,8 @@ use crate::state::{
 use crate::types::{
     AssetId, OraclePrices, Order, OrderId, OrderType, Side, SignedU256, Timestamp, TokenAmount, Usd,
 };
+
+#[derive(Clone)]
 pub struct Executor<S: ServicesBundle, O: Oracle> {
     pub state: State,
     pub services: S,
@@ -102,18 +107,23 @@ impl<S: ServicesBundle, O: Oracle> Executor<S, O> {
         now: Timestamp,
         key: PositionKey,
     ) -> Result<LiquidationPreview, String> {
-        let market = self.state.markets.get(&key.market_id).ok_or("market_not_found")?;
+        let market = self
+            .state
+            .markets
+            .get(&key.market_id)
+            .ok_or("market_not_found")?;
         let pos = self.state.positions.get(&key).ok_or("position_not_found")?;
         let prices = self.oracle.validate_and_get_prices(key.market_id)?;
 
-        let price_impact_usd_on_close = self.preview_close_price_impact_usd(market, pos, &prices)?;
+        let price_impact_usd_on_close =
+            self.preview_close_price_impact_usd(market, pos, &prices)?;
 
         let risk = RiskCfg::default();
 
         // mvp
         let fee_cfg = LiquidationFeeCfg {
-            close_position_fee_bps: 0,  
-            liquidation_fee_bps: 0,      
+            close_position_fee_bps: 0,
+            liquidation_fee_bps: 0,
         };
 
         liquidation::is_liquidatable_by_margin(
@@ -132,11 +142,16 @@ impl<S: ServicesBundle, O: Oracle> Executor<S, O> {
         now: Timestamp,
         key: PositionKey,
     ) -> Result<U256, String> {
-        let market = self.state.markets.get(&key.market_id).ok_or("market_not_found")?;
+        let market = self
+            .state
+            .markets
+            .get(&key.market_id)
+            .ok_or("market_not_found")?;
         let pos = self.state.positions.get(&key).ok_or("position_not_found")?;
         let prices = self.oracle.validate_and_get_prices(key.market_id)?;
 
-        let price_impact_usd_on_close = self.preview_close_price_impact_usd(market, pos, &prices)?;
+        let price_impact_usd_on_close =
+            self.preview_close_price_impact_usd(market, pos, &prices)?;
 
         let risk = RiskCfg::default();
 
@@ -172,17 +187,21 @@ impl<S: ServicesBundle, O: Oracle> Executor<S, O> {
 
         let impact_cfg = ImpactRebalanceConfig::default_quadratic();
 
-        let exec = self.services.pricing().get_execution_price(
-            self.services.price_impact(),
-            crate::services::pricing::ExecutionPriceParams {
-                oi: &oi_params,
-                impact_cfg: &impact_cfg,
-                side: pos.key.side,
-                direction: crate::services::pricing::TradeDirection::Decrease,
-                size_delta_usd: pos.size_usd,
-                prices: *prices,
-            },
-        ).map_err(|e| format!("pricing_error:{:?}", e))?;
+        let exec = self
+            .services
+            .pricing()
+            .get_execution_price(
+                self.services.price_impact(),
+                crate::services::pricing::ExecutionPriceParams {
+                    oi: &oi_params,
+                    impact_cfg: &impact_cfg,
+                    side: pos.key.side,
+                    direction: crate::services::pricing::TradeDirection::Decrease,
+                    size_delta_usd: pos.size_usd,
+                    prices: *prices,
+                },
+            )
+            .map_err(|e| format!("pricing_error:{:?}", e))?;
 
         Ok(exec.price_impact_usd)
     }
@@ -502,7 +521,7 @@ impl<S: ServicesBundle, O: Oracle> Executor<S, O> {
             // Realize pending impact to signed USD (conservative)
             let realized_pending_impact_usd: SignedU256 =
                 impact_tokens_to_usd_conservative(pending_impact_realized_tokens, prices)?;
-
+           
             // Include close price impact
             let realized_total_usd: SignedU256 = math::signed_add(
                 math::signed_add(realized_base_pnl_usd, realized_pending_impact_usd),
@@ -693,835 +712,7 @@ fn impact_tokens_to_usd_conservative(
         mag,
     })
 }
+
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::math::{signed_add, signed_sub};
-    use crate::oracle::Oracle;
-    use crate::services::BasicServicesBundle;
-    use crate::services::borrowing::{BasicBorrowingService, BorrowingService};
-    use crate::services::fees::{BasicFeesService, FeesService};
-    use crate::services::funding::{BasicFundingService, FundingService};
-    use crate::services::open_interest::{BasicOpenInterestService, OpenInterestService};
-    use crate::services::price_impact::{BasicPriceImpactService, PriceImpactService};
-    use crate::services::pricing::{BasicPricingService, PricingService};
-    use crate::state::{Claimables, MarketState, PoolBalances, Position, PositionKey, State};
-    use crate::types::{
-        AccountId, AssetId, MarketId, OraclePrices, Order, OrderId, OrderType, Side, Timestamp,
-        TokenAmount, Usd,
-    };
-    use primitive_types::U512;
-
-    fn borrow_index_scale() -> U256 {
-        U256::exp10(18)
-    }
-    const INCREASE_FEE_BPS: u32 = 10;
-    const HELPFUL_REBATE_PERCENT: u32 = 20;
-    const SECONDS_PER_DAY: u64 = 86_400;
-    const BASE_RATE_PER_DAY_BPS: u64 = 1;
-    const SLOPE_PER_DAY_BPS: u64 = 9;
-
-    fn bps_per_day_to_fp_per_sec(bps_per_day: u64) -> U256 {
-        let den = U256::from(10_000u64 * SECONDS_PER_DAY);
-        mul_div_u256(U256::from(bps_per_day), borrow_index_scale(), den).unwrap()
-    }
-
-    fn funding_index_scale() -> U256 {
-        U256::exp10(18) // 1e18
-    }
-
-    /// Desired funding rate (MVP): 1 bp/day = 0.01% per day when imbalance persists.
-    /// Increase to 5..20 bps/day if you want stronger incentives.
-    const DAILY_RATE_BPS: i128 = 1; // 0.01% / day
-
-    const BPS_DENOM: i128 = 10_000;
-
-    /// rate_fp_per_sec = SCALE * (DAILY_RATE_BPS / 10_000) / 86_400
-    fn rate_fp_per_sec() -> U256 {
-        (funding_index_scale() / U256::from(SECONDS_PER_DAY)) * U256::from(DAILY_RATE_BPS)
-            / U256::from(BPS_DENOM)
-    }
-    /// Simple oracle that always returns fixed prices for a given market.
-    struct TestOracle {
-        prices: OraclePrices,
-    }
-
-    impl Oracle for TestOracle {
-        fn validate_and_get_prices(&self, _market_id: MarketId) -> Result<OraclePrices, String> {
-            Ok(self.prices)
-        }
-    }
-
-    fn set_index_price(executor: &mut Executor<BasicServicesBundle, TestOracle>, px: U256) {
-        let mut p = executor.oracle.prices;
-        p.index_price_min = px;
-        p.index_price_max = px;
-        executor.oracle.prices = p;
-    }
-
-    fn usd(x: u128) -> U256 {
-        U256::from(x) * U256::exp10(30) // USD(1e30)
-    }
-
-    fn tok(x: u128) -> U256 {
-        U256::from(x) // token atoms
-    }
-
-    fn leverage_x(x: u32) -> U256 {
-        U256::from(x)
-    }
-
-    /// Convert whole tokens to atoms by decimals.
-    /// Example: 5000 USDC (6 decimals) => 5000 * 1e6 atoms.
-    fn to_atoms(tokens: u128, decimals: u8) -> U256 {
-        U256::from(tokens) * U256::exp10(decimals as usize)
-    }
-
-    /// Normalize USD(1e30) per 1 token -> USD(1e30) per 1 atom.
-    /// min: floor, max: ceil (conservative spread handling).
-    fn normalize_price_per_atom(
-        price_min_per_token: U256,
-        price_max_per_token: U256,
-        decimals: u8,
-    ) -> (U256, U256) {
-        let scale = U256::exp10(decimals as usize);
-        let min_atom = price_min_per_token / scale; // floor
-        let max_atom = div_ceil_u256(price_max_per_token, scale); // ceil
-        (min_atom, max_atom)
-    }
-    fn div_ceil_u256(a: U256, b: U256) -> U256 {
-        let q = a / b;
-        let r = a % b;
-        if r.is_zero() { q } else { q + 1 }
-    }
-
-    fn u512_to_u256_checked(x: U512) -> Result<U256, String> {
-        let be = x.to_big_endian();
-        if be[..32].iter().any(|&b| b != 0) {
-            return Err("mul_div_overflow".into());
-        }
-        Ok(U256::from_big_endian(&be[32..]))
-    }
-
-    fn mul_div_u256(a: U256, b: U256, den: U256) -> Result<U256, String> {
-        if den.is_zero() {
-            return Err("mul_div_den_zero".into());
-        }
-        let prod = U512::from(a) * U512::from(b);
-        let q = prod / U512::from(den);
-        u512_to_u256_checked(q)
-    }
-
-    pub fn signed_mul_div_u256(
-        value: U256,
-        signed: SignedU256,
-        denom: U256,
-    ) -> Result<SignedU256, String> {
-        if value.is_zero() || signed.mag.is_zero() {
-            return Ok(SignedU256::zero());
-        }
-        let mag = mul_div_u256(value, signed.mag, denom)?;
-        Ok(SignedU256 {
-            is_negative: signed.is_negative,
-            mag,
-        })
-    }
-
-    fn setup_executor(side: Side) -> (Executor<BasicServicesBundle, TestOracle>, PositionKey) {
-        let market_id: MarketId = MarketId(1);
-        let account: AccountId = AccountId([7; 32]);
-
-        let collateral_token: AssetId = AssetId(10);
-        let long_asset: AssetId = AssetId(11);
-        let short_asset: AssetId = AssetId(12);
-
-        // USDC collateral (6), ETH index (18)
-        let collateral_decimals: u8 = 6;
-        let index_decimals: u8 = 18;
-
-        // Index initial: $3000, Collateral: $1
-        let (index_price_min, index_price_max) =
-            normalize_price_per_atom(usd(3_000), usd(3_000), index_decimals);
-
-        let (collateral_price_min, collateral_price_max) =
-            normalize_price_per_atom(usd(1), usd(1), collateral_decimals);
-
-        let prices = OraclePrices {
-            index_price_min,
-            index_price_max,
-            collateral_price_min,
-            collateral_price_max,
-        };
-
-        let oracle = TestOracle { prices };
-        let services = BasicServicesBundle::default();
-
-        let mut executor: Executor<BasicServicesBundle, TestOracle> =
-            Executor::new(State::default(), services, oracle);
-
-        // Ensure market exists + has sane params used by pricing/borrowing/funding
-        let m = executor.state.markets.entry(market_id).or_insert_with(|| {
-            let mut mm = MarketState::default();
-            mm.id = market_id;
-            mm
-        });
-
-        m.long_asset = long_asset;
-        m.short_asset = short_asset;
-        m.liquidity_usd = usd(1_000_000);
-
-        let key = PositionKey {
-            account,
-            market_id,
-            collateral_token,
-            side,
-        };
-
-        (executor, key)
-    }
-
-    fn open_position(
-        executor: &mut Executor<BasicServicesBundle, TestOracle>,
-        t: Timestamp,
-        key: PositionKey,
-        collateral_tokens: u128,
-        collateral_decimals: u8,
-        leverage_x: u32,
-    ) {
-        let deposit_atoms = to_atoms(collateral_tokens, collateral_decimals);
-
-        let order = Order {
-            account: key.account,
-            market_id: key.market_id,
-            side: key.side,
-            collateral_token: key.collateral_token,
-            size_delta_usd: U256::zero(), // derived inside executor
-            collateral_delta_tokens: deposit_atoms,
-            target_leverage_x: leverage_x,
-            order_type: OrderType::Increase,
-            withdraw_collateral_amount: U256::zero(),
-            created_at: t,
-            valid_from: t - 1,
-            valid_until: t + 300,
-        };
-
-        let id: OrderId = executor.submit_order(order);
-        executor.execute_order(t, id).expect("open position must succeed");
-    }
-
-    #[test]
-    fn is_liquidatable_by_margin_long_crosses_threshold() {
-        let (mut executor, key) = setup_executor(Side::Long);
-        let t: Timestamp = 1_000;
-
-        // High leverage
-        // 500 USDC * 20x => ~10k notional
-        let collateral_tokens = 500;
-        let collateral_decimals = 6;
-        let leverage_x = 20;
-        open_position(&mut executor, t, key, collateral_tokens, collateral_decimals, leverage_x);
-
-        let liq_price = executor
-            .calculate_liquidation_price(t, key)
-            .expect("liq price calc must succeed");
-        assert!(liq_price > U256::zero(), "liq_price must be > 0 for this setup");
-        println!("liq_price {:?}", liq_price);
-
-        let margin = (liq_price / U256::from(100u8)) + U256::from(1u8); // ~1% + 1 atom
-        let above = liq_price + margin;
-        set_index_price(&mut executor, above);
-
-        let preview = executor
-            .is_liquidatable_by_margin(t, key)
-            .expect("must return preview");
-        assert!(
-            !preview.is_liquidatable,
-            "long should NOT be liquidatable above threshold; liq_price={liq_price}, px={above}, preview={preview:?}"
-        );
-
-        let below = liq_price.saturating_sub(margin);
-        set_index_price(&mut executor, below);
-
-         let preview = executor
-            .is_liquidatable_by_margin(t, key)
-            .expect("must return preview");
-        assert!(
-            preview.is_liquidatable,
-            "long should be liquidatable below threshold; liq_price={liq_price}, px={below}, preview={preview:?}"
-        );
-    }
-
-    #[test]
-    fn is_liquidatable_by_margin_short_crosses_threshold() {
-        let (mut executor, key) = setup_executor(Side::Short);
-        let t: Timestamp = 2_000;
-
-        // 500 USDC * 20x => ~10k notional
-        let collateral_tokens = 500;
-        let collateral_decimals = 6;
-        let leverage_x = 20;
-        open_position(&mut executor, t, key, collateral_tokens, collateral_decimals, leverage_x);
-
-        let liq_price = executor
-            .calculate_liquidation_price(t, key)
-            .expect("liq price calc must succeed");
-        assert!(liq_price > U256::zero(), "liq_price must be > 0 for this setup");
-
-        let margin = (liq_price / U256::from(100u8)) + U256::from(1u8);
-
-         // Price is below the threshold => short is not liquidated
-        let below = liq_price.saturating_sub(margin);
-        set_index_price(&mut executor, below);
-
-        let preview = executor
-            .is_liquidatable_by_margin(t, key)
-            .expect("must return preview");
-        assert!(
-            !preview.is_liquidatable,
-            "short should NOT be liquidatable below threshold; liq_price={liq_price}, px={below}, preview={preview:?}"
-        );
-
-        // Price is higher the threshold => short is liquidated
-        let above = liq_price + margin;
-        set_index_price(&mut executor, above);
-
-        let preview = executor
-            .is_liquidatable_by_margin(t, key)
-            .expect("must return preview");
-        assert!(
-            preview.is_liquidatable,
-            "short should be liquidatable above threshold; liq_price={liq_price}, px={above}, preview={preview:?}"
-        );
-    }
-
-   
-    /// Full workflow test:
-    ///
-    /// 1) Market starts mildly long-heavy (more longs than shorts).
-    /// 2) First order: open a short position at time t1.
-    /// 3) Time passes (1 hour).
-    /// 4) Second order: increase the same short at time t2.
-    ///
-    /// We check:
-    ///  - open interest updates (oi_long / oi_short),
-    ///  - funding index + position funding snapshot,
-    ///  - borrowing index + position borrowing snapshot,
-    ///  - collateral decreases due to fees + funding + borrowing,
-    ///  - pool receives fee tokens,
-    ///  - user gets positive funding claimables on receiving side
-    ///    (because shorts receive funding in long-heavy market).
-    #[test]
-    fn full_increase_flow_with_real_services() {
-        let market_id: MarketId = MarketId(1);
-        let account: AccountId = AccountId([2; 32]);
-        let collateral_token: AssetId = AssetId(10);
-        let long_asset: AssetId = AssetId(11);
-        let short_asset: AssetId = AssetId(12);
-
-        // Collateral = USDC-like (6 decimals)
-        let collateral_decimals: u8 = 6;
-        // Index asset = ETH (18 decimals)
-        let eth_decimals: u8 = 18;
-
-        // --- Price: "1 ETH costs 2.981 USD" ---
-        let eth_usd_per_eth_token: U256 = usd(2_981);
-
-        let eth_min_token = eth_usd_per_eth_token.saturating_sub(usd(1));
-        let eth_max_token = eth_usd_per_eth_token.checked_add(usd(1)).unwrap();
-
-        let (index_price_min, index_price_max) =
-            normalize_price_per_atom(eth_min_token, eth_max_token, eth_decimals);
-
-        // Collateral price (USDC): $1 per token, normalized per atom
-        let (collateral_price_min, collateral_price_max) =
-            normalize_price_per_atom(usd(1), usd(1), collateral_decimals);
-
-        // Prices are "per smallest unit" already:
-        // index_price_*: USD(1e30) per 1 index token atom
-        // collateral_price_*: USD(1e30) per 1 collateral atom
-        let oracle_prices = OraclePrices {
-            index_price_min,
-            index_price_max,
-            collateral_price_min,
-            collateral_price_max,
-        };
-
-        let services = BasicServicesBundle::default();
-        let oracle = TestOracle {
-            prices: oracle_prices,
-        };
-
-        let mut executor: Executor<BasicServicesBundle, TestOracle> =
-            Executor::new(State::default(), services, oracle);
-
-        let t0: Timestamp = 1_000_000;
-        // first order execution time
-        let t1: Timestamp = t0 + 60;
-        // second execution, +1 hour
-        let t2: Timestamp = t1 + 3600;
-
-        // Initial market state: mildly long-heavy and non-zero liquidity
-        let market = executor.state.markets.entry(market_id).or_insert_with(|| {
-            let mut m = MarketState::default();
-            m.id = market_id;
-            m
-        });
-
-        // Example: longs = 120k, shorts = 80k -> long-heavy (+40k skew)
-        market.oi_long_usd = usd(120_000);
-        market.oi_short_usd = usd(80_000);
-        market.liquidity_usd = usd(1_000_000);
-
-        market.long_asset = long_asset;
-        market.short_asset = short_asset;
-
-        let m_before1 = executor.state.markets.get(&market_id).unwrap().clone();
-
-        // STEP 1: first short increase at t1
-
-        // User deposits 5_000 collateral tokens, leverage 4x → target 20_000 USD notional.
-        let deposit_usdc_atoms = to_atoms(5_000, collateral_decimals);
-        let mut order1 = Order {
-            account,
-            market_id,
-            side: Side::Short,
-            collateral_token,
-            size_delta_usd: U256::zero(), // derived in executor
-            collateral_delta_tokens: deposit_usdc_atoms,
-            target_leverage_x: 4,
-            order_type: OrderType::Increase,
-            withdraw_collateral_amount: U256::zero(),
-            created_at: t1,
-            valid_from: t1 - 30,
-            valid_until: t1 + 300,
-        };
-
-        let order1_id: OrderId = executor.submit_order(order1.clone());
-
-        executor
-            .execute_order(t1, order1_id)
-            .expect("first execute_order must succeed");
-
-        // Assertions after step 1
-
-        // Order must be removed
-        assert!(
-            executor.state.orders.get(order1_id).is_none(),
-            "order1 must be removed after execution"
-        );
-
-        // Position updated
-
-        let pos_key = PositionKey {
-            account,
-            market_id,
-            collateral_token,
-            side: Side::Short,
-        };
-        let pos_after1 = executor
-            .state
-            .positions
-            .get(&pos_key)
-            .expect("position must exist after first execution")
-            .clone();
-
-        // Notional check: size_delta_usd from collateral * price * leverage
-        let expected_size_delta1 = order1
-            .collateral_delta_tokens
-            .checked_mul(oracle_prices.collateral_price_min)
-            .expect("collateral_usd overflow")
-            .checked_mul(leverage_x(order1.target_leverage_x))
-            .expect("size_delta_usd overflow");
-        assert_eq!(
-            expected_size_delta1,
-            usd(20_000),
-            "by construction: 5000 * 1 * 4 = 20_000 USD notional"
-        );
-        assert_eq!(
-            pos_after1.size_usd, expected_size_delta1,
-            "position size_usd must reflect derived size_delta_usd"
-        );
-
-        assert!(
-            !pos_after1.size_tokens.is_zero(),
-            "short position must have non-zero size_tokens"
-        );
-
-        // OI check
-        let m_after1 = executor.state.markets.get(&market_id).unwrap().clone();
-        assert_eq!(
-            m_after1.oi_long_usd, m_before1.oi_long_usd,
-            "long OI must not change for a short increase"
-        );
-        assert_eq!(
-            m_after1.oi_short_usd,
-            m_before1.oi_short_usd + expected_size_delta1,
-            "short OI must increase by size_delta_usd"
-        );
-
-        // Funding / borrowing indices updated to t1.
-        assert_eq!(
-            m_after1.funding.last_updated_at, t1,
-            "funding.last_updated_at must be updated to t1"
-        );
-        assert_eq!(
-            m_after1.borrowing.last_updated_at, t1,
-            "borrowing.last_updated_at must be updated to t1"
-        );
-
-        // Position snapshots must match current funding / borrowing indices for its side.
-        assert_eq!(
-            pos_after1.funding_index, m_after1.funding.cumulative_index_short,
-            "short position funding_index must match market short index after step 1"
-        );
-        assert_eq!(
-            pos_after1.borrowing_index, m_after1.borrowing.cumulative_factor,
-            "position borrowing_index must match market borrowing factor after step 1"
-        );
-
-        // Collateral vs pool: all costs are pure trading fee on step 1
-        assert!(
-            !pos_after1.collateral_amount.is_zero(),
-            "collateral must remain positive after first step"
-        );
-
-        // Pool must receive position fee tokens for the collateral asset.
-        let fee_pool_after1 = executor
-            .state
-            .pool_balances
-            .get_fee_for_pool(market_id, collateral_token);
-        assert!(
-            !fee_pool_after1.is_zero(),
-            "after first step, pool must have some fee tokens from position fees"
-        );
-
-        // On step 1 there is:
-        //  - NO funding payment (position size was 0 before snapshot),
-        //  - NO borrowing payment (position size was 0 before, delta index = 0).
-        //
-        // So:
-        //   deposit1 = position_collateral_after1 + trading_fee_tokens_to_pool
-        let deposit1 = order1.collateral_delta_tokens;
-        let collat_after1 = pos_after1.collateral_amount;
-        assert!(
-            deposit1 > collat_after1,
-            "some part of deposited collateral must be spent on trading fees"
-        );
-
-        let spent_tokens_step1 = deposit1 - collat_after1;
-
-        assert_eq!(
-            spent_tokens_step1, fee_pool_after1,
-            "all spent collateral tokens in step 1 must end up in the pool as trading fees"
-        );
-
-        // Funding claimables must still be zero after the first touch
-        let claim_long_after1 = executor.state.claimables.get_funding(account, long_asset);
-        let claim_short_after1 = executor.state.claimables.get_funding(account, short_asset);
-
-        assert_eq!(
-            claim_long_after1,
-            U256::zero(),
-            "no funding rewards should be claimable right after the first increase"
-        );
-        assert_eq!(
-            claim_short_after1,
-            U256::zero(),
-            "no funding rewards should be claimable right after the first increase"
-        );
-
-        // STEP 2: second short increase at t2 (+1 hour)
-
-        // Second order: deposit 1_000 collateral tokens with 4x leverage:
-        //   collateral_usd2 = 1_000 * 1 = 1_000
-        //   size_delta_usd2 = 1_000 * 4 = 4_000
-        let collateral_delta_tokens2 = to_atoms(1_000, collateral_decimals);
-        let target_leverage_x2 = 4;
-
-        let order2 = Order {
-            account,
-            market_id,
-            side: Side::Short,
-            collateral_token,
-            size_delta_usd: U256::zero(), // derived inside executor
-            collateral_delta_tokens: collateral_delta_tokens2,
-            target_leverage_x: target_leverage_x2,
-            order_type: OrderType::Increase,
-            withdraw_collateral_amount: U256::zero(),
-            created_at: t2,
-            valid_from: t2 - 30,
-            valid_until: t2 + 300,
-        };
-
-        let order2_id: OrderId = executor.submit_order(order2.clone());
-
-        // Snapshots BEFORE step 2
-        let pos_before2 = pos_after1.clone();
-        let m_before2 = executor.state.markets.get(&market_id).unwrap().clone();
-        let fee_pool_before2 = fee_pool_after1;
-
-        executor
-            .execute_order(t2, order2_id)
-            .expect("second execute_order must succeed");
-
-        let pos_after2 = executor
-            .state
-            .positions
-            .get(&pos_key)
-            .cloned()
-            .expect("position must exist after second execution");
-        let m_after2 = executor.state.markets.get(&market_id).unwrap().clone();
-        let fee_pool_after2 = executor
-            .state
-            .pool_balances
-            .get_fee_for_pool(market_id, collateral_token);
-
-        // size_usd and OI after step 2
-
-        let collateral_usd2: Usd = collateral_delta_tokens2 * oracle_prices.collateral_price_min; // = 1000
-        let expected_size_delta_usd2: Usd = collateral_usd2 * U256::from(target_leverage_x2); // = 4000
-
-        assert_eq!(
-            pos_after2.size_usd,
-            pos_after1.size_usd + expected_size_delta_usd2,
-            "position size_usd must increase by second order notional (4k)"
-        );
-
-        assert_eq!(
-            m_after2.oi_long_usd, m_after1.oi_long_usd,
-            "long OI must remain unchanged on second short increase"
-        );
-        assert_eq!(
-            m_after2.oi_short_usd,
-            m_after1.oi_short_usd + expected_size_delta_usd2,
-            "short OI must additionally increase by 4k on step 2"
-        );
-
-        // Funding index evolution between t1 and t2
-
-        let dt2: u64 = t2 - m_before2.funding.last_updated_at;
-        assert_eq!(m_before2.funding.last_updated_at, t1);
-
-        let long_oi2 = m_before2.oi_long_usd;
-        let short_oi2 = m_before2.oi_short_usd;
-        let total_oi2 = long_oi2 + short_oi2;
-        assert!(!total_oi2.is_zero(), "total OI must be > 0 on step 2");
-
-        let imbalance2 = long_oi2 - short_oi2; // still > 0 (long-heavy)
-        assert!(
-            !imbalance2.is_zero(),
-            "market must remain long-heavy before second order"
-        );
-
-        // In BasicFundingService:
-        //   delta_index_fp = rate_abs_fp_per_sec * dt
-        //   if long-heavy:
-        //      funding_long += delta_index_fp
-        //      funding_short -= delta_index_fp
-        let delta_index_funding_fp = rate_fp_per_sec() * U256::from(dt2 as i128);
-
-        let expected_funding_index_long_after2 = signed_add(
-            m_before2.funding.cumulative_index_long,
-            SignedU256 {
-                is_negative: false,
-                mag: delta_index_funding_fp,
-            },
-        );
-        let expected_funding_index_short_after2 = signed_sub(
-            m_before2.funding.cumulative_index_short,
-            SignedU256 {
-                is_negative: false,
-                mag: delta_index_funding_fp,
-            },
-        );
-
-        assert_eq!(
-            m_after2.funding.cumulative_index_long, expected_funding_index_long_after2,
-            "funding long index must move by +delta_index_funding_fp"
-        );
-        assert_eq!(
-            m_after2.funding.cumulative_index_short, expected_funding_index_short_after2,
-            "funding short index must move by -delta_index_funding_fp"
-        );
-
-        // Position snapshot for short side must match new market short index.
-        assert_eq!(
-            pos_after2.funding_index, m_after2.funding.cumulative_index_short,
-            "after step 2, short position funding_index must match market short index"
-        );
-
-        // Expected funding fee for step 2:
-        //   delta_idx = funding_short_after2 - pos_before2.funding_index
-        //   funding_fee_usd = size_usd * delta_idx / SCALE
-        let delta_idx_funding2 = signed_sub(
-            expected_funding_index_short_after2,
-            pos_before2.funding_index,
-        );
-
-        let expected_funding_usd2: SignedU256 = signed_mul_div_u256(
-            pos_before2.size_usd,
-            delta_idx_funding2,
-            funding_index_scale(),
-        )
-        .expect("signed_mul_div_u256 must not overflow");
-
-        // For short in long-heavy market user should RECEIVE funding:
-        assert!(
-            expected_funding_usd2.is_negative && !expected_funding_usd2.mag.is_zero(),
-            "short position must receive funding (negative cost_usd) on step 2"
-        );
-
-        println!("expected_funding_usd2 {:?}", expected_funding_usd2);
-        // Borrowing index evolution between t1 and t2
-
-        let dt2_borrow: u64 = t2 - m_before2.borrowing.last_updated_at;
-        assert_eq!(m_before2.borrowing.last_updated_at, t1);
-
-        let borrowed2 = (m_before2.oi_long_usd + m_before2.oi_short_usd);
-        let liquidity2 = m_before2.liquidity_usd;
-        assert!(liquidity2 > U256::zero());
-
-        // Utilization in [0,1] * SCALE:
-        let scale = borrow_index_scale();
-        let mut util_fp2 = mul_div_u256(borrowed2, scale, liquidity2).expect("util mul/div");
-        if util_fp2 > scale {
-            util_fp2 = scale;
-        }
-
-        // In BasicBorrowingService:
-        //   rate_per_sec_fp = base_rate + slope * util
-        //   delta_index = rate_per_sec_fp * dt
-        // rate_per_sec_fp = base + slope * util / SCALE
-        let base_rate_fp_per_sec = bps_per_day_to_fp_per_sec(BASE_RATE_PER_DAY_BPS);
-        let slope_fp_per_sec = bps_per_day_to_fp_per_sec(SLOPE_PER_DAY_BPS);
-
-        let slope_term = mul_div_u256(slope_fp_per_sec, util_fp2, scale).expect("slope_term");
-        let rate_per_sec_fp2 = base_rate_fp_per_sec + slope_term;
-
-        // delta_index = rate * dt
-        let delta_index_borrow_fp = rate_per_sec_fp2 * U256::from(dt2_borrow);
-        let expected_borrow_factor_after2 =
-            m_before2.borrowing.cumulative_factor + delta_index_borrow_fp;
-
-        assert_eq!(
-            m_after2.borrowing.cumulative_factor, expected_borrow_factor_after2,
-            "borrowing cumulative factor must move according to utilization formula"
-        );
-
-        println!(
-            "m_after2.borrowing.cumulative_factor {:?}",
-            m_after2.borrowing.cumulative_factor
-        );
-
-        // Position snapshot must equal new factor.
-        assert_eq!(
-            pos_after2.borrowing_index, m_after2.borrowing.cumulative_factor,
-            "after step 2, position borrowing_index must equal market borrowing factor"
-        );
-
-        // Expected borrowing cost (USD):
-        let delta_idx_borrow2 = expected_borrow_factor_after2 - pos_before2.borrowing_index;
-        let expected_borrowing_usd2 = mul_div_u256(
-            pos_before2.size_usd,
-            delta_idx_borrow2,
-            borrow_index_scale(),
-        )
-        .expect("borrow fee mul/div");
-
-        assert!(
-            !expected_borrowing_usd2.is_zero(),
-            "borrowing fee must be > 0 on step 2 with non-zero dt"
-        );
-        println!("expected_borrowing_usd2 {:?}", expected_borrowing_usd2);
-
-        // Trading fee for second order
-
-        let oi_params2 = executor.services.open_interest().for_increase(
-            m_before2.oi_long_usd,
-            m_before2.oi_short_usd,
-            expected_size_delta_usd2,
-            order2.side,
-        );
-
-        let exec_expected2 = executor
-            .services
-            .pricing()
-            .get_execution_price(
-                executor.services.price_impact(),
-                crate::services::pricing::ExecutionPriceParams {
-                    oi: &oi_params2,
-                    impact_cfg: &ImpactRebalanceConfig::default_quadratic(),
-                    side: order2.side,
-                    size_delta_usd: expected_size_delta_usd2,
-                    direction: pricing::TradeDirection::Increase,
-                    prices: oracle_prices,
-                },
-            )
-            .expect("pricing for second increase must succeed");
-
-        assert!(
-            exec_expected2.balance_was_improved,
-            "second short on long-heavy market must also be helpful"
-        );
-
-        let mut effective_bps2: u32 = INCREASE_FEE_BPS;
-        effective_bps2 = effective_bps2.saturating_mul(100 - HELPFUL_REBATE_PERCENT) / 100;
-
-        let expected_trading_fee_usd2 =
-            (expected_size_delta_usd2 * U256::from(effective_bps2) / U256::from(10_000));
-        let expected_trading_fee_tokens2: TokenAmount =
-            expected_trading_fee_usd2 / oracle_prices.collateral_price_min;
-
-        // Pool fee increment on step 2
-        //
-        // Pool receives:
-        //   - position fee tokens (trading),
-        //   - borrowing fee tokens.
-        //
-        // Funding rewards go to Claimables (not to pool).
-        let delta_fee_pool2 = fee_pool_after2 - fee_pool_before2;
-        let expected_borrowing_tokens2: TokenAmount =
-            expected_borrowing_usd2 / oracle_prices.collateral_price_min;
-
-        assert_eq!(
-            delta_fee_pool2,
-            expected_trading_fee_tokens2 + expected_borrowing_tokens2,
-            "pool fee increment on step 2 must equal trading fee tokens + borrowing fee tokens"
-        );
-
-        println!("delta_fee_pool2 {:?}", delta_fee_pool2);
-
-        // Collateral after step 2
-        //
-        // Formula:
-        //   collateral_after2 =
-        //      collateral_before2
-        //      + collateral_deposit2
-        //      - total_cost_tokens2
-        //
-        // where:
-        //   total_cost_usd2 = funding_usd2 + borrowing_usd2 + trading_usd2
-        //   total_cost_tokens2 = total_cost_usd2 / collateral_price_min
-        let expected_total_usd2: Usd = expected_borrowing_usd2 + expected_trading_fee_usd2;
-        let expected_total_tokens2: TokenAmount =
-            expected_total_usd2 / oracle_prices.collateral_price_min;
-
-        let expected_collateral_after2: TokenAmount =
-            pos_before2.collateral_amount + collateral_delta_tokens2 - expected_total_tokens2;
-
-        assert_eq!(
-            pos_after2.collateral_amount, expected_collateral_after2,
-            "collateral after step 2 must equal coll_before + deposit2 - total_cost_tokens2"
-        );
-
-        // // // Funding claimables: user must have positive funding tokens somewhere
-
-        // // let funding_long = executor.state.claimables.get_funding(account, long_asset);
-        // // let funding_short = executor.state.claimables.get_funding(account, short_asset);
-
-        // // assert!(
-        // //     funding_long > 0 || funding_short > 0,
-        // //     "after second step, user must have some positive funding claimable on at least one asset"
-        // // );
-    }
-}
+#[path = "executor_tests/mod.rs"]
+mod tests;

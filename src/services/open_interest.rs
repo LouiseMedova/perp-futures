@@ -46,7 +46,7 @@ pub trait OpenInterestService {
 }
 
 /// Minimal implementation that just follows the convention above.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct BasicOpenInterestService;
 
 impl OpenInterestService for BasicOpenInterestService {

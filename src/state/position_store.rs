@@ -37,8 +37,7 @@ pub struct Position {
     pub last_updated_at: Timestamp,
 }
 
-/// Хранилище позиций.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct PositionStore {
     positions: HashMap<PositionKey, Position>,
 }

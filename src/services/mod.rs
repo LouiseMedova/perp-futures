@@ -46,6 +46,7 @@ pub trait ServicesBundle {
     fn open_interest(&self) -> &Self::OpenInterest;
 }
 
+#[derive(Clone)]
 pub struct BasicServicesBundle {
     pub price_impact: price_impact::BasicPriceImpactService,
     pub pricing: pricing::BasicPricingService,

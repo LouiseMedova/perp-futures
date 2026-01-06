@@ -7,7 +7,7 @@ use crate::types::{AccountId, AssetId, TokenAmount};
 /// Claimables is a ledger of "rights to receive something later".
 /// We don't move real tokens immediately; we just accumulate how much
 /// each account can claim per asset.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Claimables {
     /// Funding claimables per (account, asset).
     ///

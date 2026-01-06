@@ -15,7 +15,7 @@ pub use position_store::*;
 use crate::types::*;
 use std::collections::HashMap;
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct State {
     pub positions: PositionStore,
     pub markets: HashMap<MarketId, MarketState>,

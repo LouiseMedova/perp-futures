@@ -213,7 +213,7 @@ fn get_price_impact_usd(
 
 /// Basic implementation: just forwards to `get_price_impact_usd`
 /// with the math above.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct BasicPriceImpactService;
 
 pub trait PriceImpactService {

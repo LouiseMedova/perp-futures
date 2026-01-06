@@ -71,7 +71,7 @@ pub trait PricingService {
 }
 
 /// Basic implementation that uses a PriceImpactService inside.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct BasicPricingService;
 
 impl PricingService for BasicPricingService {

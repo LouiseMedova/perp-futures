@@ -45,7 +45,7 @@ pub trait MarginService {
     // ) -> bool;
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct BasicMarginService;
 
 impl MarginService for BasicMarginService {}
