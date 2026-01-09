@@ -71,6 +71,7 @@ where
 
     let total_usd = funding_usd + borrowing_usd + trading_usd;
 
+    println!("TOTAL USD {:?}", total_usd);
     Ok(StepCosts {
         funding_usd,
         borrowing_usd,

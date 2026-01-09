@@ -11,7 +11,7 @@ use crate::services::price_impact::ImpactRebalanceConfig;
 use crate::services::pricing::PricingService;
 use crate::services::pricing::{self, ExecutionPriceParams};
 use crate::services::step_costs::{apply_step_costs_to_position, compute_step_costs};
-use crate::types::{Order, OrderType, Side, Timestamp};
+use crate::types::{OraclePrices, Order, OrderType, Side, SignedU256, Timestamp};
 
 const SECONDS_PER_DAY: u64 = 86_400;
 
@@ -50,12 +50,50 @@ fn bps_per_day_to_fp_per_sec(bps_per_day: u64) -> U256 {
     mul_div_u256(U256::from(bps_per_day), borrow_index_scale(), den).unwrap()
 }
 
-fn calc_long_pnl_usd(pos_size_tokens: U256, entry_usd: U256, close_px_usd_per_atom: U256) -> U256 {
-    // pnl_usd = size_tokens * close_px - entry_usd  (assume positive)
+fn calc_long_base_pnl_usd(
+    pos_size_tokens: U256,
+    entry_usd: U256,
+    close_px_usd_per_atom: U256,
+) -> SignedU256 {
     let value = pos_size_tokens * close_px_usd_per_atom;
-    assert!(value >= entry_usd, "test expects positive pnl");
-    value - entry_usd
+    if value >= entry_usd {
+        SignedU256::pos(value - entry_usd)
+    } else {
+        SignedU256::neg(entry_usd - value)
+    }
 }
+
+/// Convert signed impact tokens -> signed USD, conservative:
+/// +tokens => * index_price_min
+/// -tokens => * index_price_max
+fn impact_tokens_to_usd_conservative_local(
+    tokens: SignedU256,
+    prices: &OraclePrices,
+) -> Result<SignedU256, String> {
+    if tokens.mag.is_zero() {
+        return Ok(SignedU256::zero());
+    }
+
+    let px = if tokens.is_negative {
+        prices.index_price_max
+    } else {
+        prices.index_price_min
+    };
+    if px.is_zero() {
+        return Err("invalid_index_price_for_pending_impact".into());
+    }
+
+    let mag = tokens
+        .mag
+        .checked_mul(px)
+        .ok_or("pending_impact_usd_overflow")?;
+    Ok(SignedU256 {
+        is_negative: tokens.is_negative,
+        mag,
+    })
+}
+
+
 #[test]
 fn decrease_full_close_long_profit_fees_and_indices() {
     // Scenario:
@@ -130,14 +168,61 @@ fn decrease_full_close_long_profit_fees_and_indices() {
         env.collateral_token,
     );
 
-    // Move price up: 3000 -> 3300 (profit for long).
-    set_index_price_usd_per_token(&mut env.executor, 3_300, env.index_decimals);
+    // ---------------------------------------------------------------------
+    // Recompute expected pending impact from the OPEN (Increase) pricing.
+    // ---------------------------------------------------------------------
 
-    let prices = env
+    // Pre-open OI = post-open OI minus the opened size (for a long increase).
+    let pre_oi_long = m_before
+        .oi_long_usd
+        .checked_sub(pos_before.size_usd)
+        .expect("pre_oi_long underflow");
+    let pre_oi_short = m_before.oi_short_usd;
+
+    let oi_inc = env.executor.services.open_interest().for_increase(
+        pre_oi_long,
+        pre_oi_short,
+        pos_before.size_usd,
+        Side::Long,
+    );
+    let impact_cfg = ImpactRebalanceConfig::default_quadratic();
+    let prices_open = env
         .executor
         .oracle
         .validate_and_get_prices(env.market_id)
-        .expect("oracle prices");
+        .expect("oracle prices open");
+    let exec_inc = env
+        .executor
+        .services
+        .pricing()
+        .get_execution_price(
+            env.executor.services.price_impact(),
+            ExecutionPriceParams {
+                oi: &oi_inc,
+                impact_cfg: &impact_cfg,
+                side: Side::Long,
+                size_delta_usd: pos_before.size_usd,
+                direction: pricing::TradeDirection::Increase,
+                prices: prices_open,
+            },
+        )
+        .expect("pricing increase");
+
+    assert_eq!(
+        pos_before.pending_impact_tokens, exec_inc.price_impact_amount_tokens,
+        "position.pending_impact_usd must match pricing-derived pending impact at open"
+    );
+
+    // ---------------------------------------------------------------------
+    // Move price up: 3000 -> 3300 (profit for long).
+    // ---------------------------------------------------------------------
+    set_index_price_usd_per_token(&mut env.executor, 3_300, env.index_decimals);
+
+    let prices_close = env
+        .executor
+        .oracle
+        .validate_and_get_prices(env.market_id)
+        .expect("oracle prices close");
 
     // Prepare a full-close decrease order.
     let close_order = Order {
@@ -151,13 +236,14 @@ fn decrease_full_close_long_profit_fees_and_indices() {
         target_leverage_x: 0,
         order_type: OrderType::Decrease,
         withdraw_collateral_amount: U256::zero(),
-
         created_at: t2,
         valid_from: t2.saturating_sub(1),
         valid_until: t2 + 300,
     };
 
-    // EXPECTED INDICES
+    // ---------------------------------------------------------------------
+    // EXPECTED INDICES + STEP COSTS (funding/borrowing/trading)
+    // ---------------------------------------------------------------------
 
     // Funding index update t1 -> t2
     let dt_funding = t2 - m_before.funding.last_updated_at;
@@ -167,36 +253,27 @@ fn decrease_full_close_long_profit_fees_and_indices() {
     );
 
     let delta_funding_fp = funding_rate_fp_per_sec() * U256::from(dt_funding);
-    let funding_scale = funding_index_scale();
-
-    // funding_cost_usd = size_usd * delta_idx / SCALE, where delta_idx == +delta_funding_fp for long
-    let funding_cost_usd = mul_div_u256(pos_before.size_usd, delta_funding_fp, funding_scale)
-        .expect("funding mul/div");
-    let funding_cost_tokens = funding_cost_usd / prices.collateral_price_min;
-
-    let long_oi = m_before.oi_long_usd;
-    let short_oi = m_before.oi_short_usd;
-
-    // For long-heavy market: long index increases, short index decreases.
-    let is_long_heavy = long_oi > short_oi;
-    assert!(is_long_heavy, "test expects a long-heavy market");
-
-    let delta_funding_fp = funding_rate_fp_per_sec() * U256::from(dt_funding);
 
     let expected_funding_long_after = crate::math::signed_add(
         m_before.funding.cumulative_index_long,
-        crate::types::SignedU256 {
+        SignedU256 {
             is_negative: false,
             mag: delta_funding_fp,
         },
     );
     let expected_funding_short_after = crate::math::signed_sub(
         m_before.funding.cumulative_index_short,
-        crate::types::SignedU256 {
+        SignedU256 {
             is_negative: false,
             mag: delta_funding_fp,
         },
     );
+
+    // Funding cost tokens (long-heavy => long pays funding)
+    let funding_cost_usd =
+        mul_div_u256(pos_before.size_usd, delta_funding_fp, funding_index_scale())
+            .expect("funding mul/div");
+    let funding_cost_tokens = funding_cost_usd / prices_close.collateral_price_min;
 
     // Borrowing factor update t1 -> t2
     let dt_borrow = t2 - m_before.borrowing.last_updated_at;
@@ -236,7 +313,98 @@ fn decrease_full_close_long_profit_fees_and_indices() {
     let expected_borrowing_usd =
         mul_div_u256(pos_before.size_usd, delta_idx_borrow, borrow_index_scale())
             .expect("borrow fee mul/div");
-    let expected_borrowing_tokens = expected_borrowing_usd / prices.collateral_price_min;
+    let expected_borrowing_tokens = expected_borrowing_usd / prices_close.collateral_price_min;
+
+    // Trading fee: determine helpfulness via pricing for DECREASE (so it matches engine behavior)
+    let oi_dec = env.executor.services.open_interest().for_decrease(
+        m_before.oi_long_usd,
+        m_before.oi_short_usd,
+        close_order.size_delta_usd,
+        close_order.side,
+    );
+
+    let exec_dec = env
+        .executor
+        .services
+        .pricing()
+        .get_execution_price(
+            env.executor.services.price_impact(),
+            ExecutionPriceParams {
+                oi: &oi_dec,
+                impact_cfg: &impact_cfg,
+                side: close_order.side,
+                size_delta_usd: close_order.size_delta_usd,
+                direction: pricing::TradeDirection::Decrease,
+                prices: prices_close,
+            },
+        )
+        .expect("pricing decrease");
+
+    let mut expected_bps = DECREASE_FEE_BPS;
+    if exec_dec.balance_was_improved {
+        expected_bps = expected_bps.saturating_mul(100 - HELPFUL_REBATE_PERCENT) / 100;
+    }
+
+    let trading_fee_usd = mul_div_u256(
+        pos_before.size_usd,
+        U256::from(expected_bps),
+        U256::from(10_000u32),
+    )
+    .expect("trading fee mul/div");
+    let trading_fee_tokens = trading_fee_usd / prices_close.collateral_price_min;
+
+    let expected_fee_pool_delta = trading_fee_tokens + expected_borrowing_tokens;
+
+    // ---------------------------------------------------------------------
+    // EXPECTED realized PnL TOKENS INCLUDING pending impact TOKENS
+    // ---------------------------------------------------------------------
+
+    // Base pnl in USD -> convert to collateral tokens with engine rounding
+    let base_pnl_usd: SignedU256 = calc_long_base_pnl_usd(
+        pos_before.size_tokens,
+        pos_before.size_usd,
+        prices_close.index_price_min,
+    );
+
+    // Stored pending impact (full close => realize 100%).
+    let pending_impact_usd: SignedU256 =
+        impact_tokens_to_usd_conservative_local(pos_before.pending_impact_tokens, &prices_close)
+            .expect("pending impact tokens -> usd");
+
+    let realized_total_usd = crate::math::signed_add(
+        crate::math::signed_add(base_pnl_usd, pending_impact_usd),
+        exec_dec.price_impact_usd,
+    );
+
+    let pnl_tokens_signed: SignedU256 =
+        math::pnl::pnl_usd_to_collateral_tokens(realized_total_usd, &prices_close)
+            .expect("total pnl usd->collateral tokens");
+    // Costs are taken from collateral first
+
+    let close_costs_tokens = trading_fee_tokens + expected_borrowing_tokens + funding_cost_tokens;
+
+    assert!(
+        pos_before.collateral_amount >= close_costs_tokens,
+        "position must have enough collateral for close costs (else liquidation path)"
+    );
+
+    let mut expected_user_delta = pos_before.collateral_amount - close_costs_tokens;
+
+    let (expected_pool_paid, expected_pool_received) = if pnl_tokens_signed.is_negative {
+        // Loss / negative impact reduces user output; pool receives.
+        expected_user_delta = expected_user_delta
+            .checked_sub(pnl_tokens_signed.mag)
+            .expect("loss must be covered in this scenario (else liquidation path)");
+        (U256::zero(), pnl_tokens_signed.mag)
+    } else {
+        // Profit / positive impact increases user output; pool pays.
+        expected_user_delta = expected_user_delta + pnl_tokens_signed.mag;
+        (pnl_tokens_signed.mag, U256::zero())
+    };
+
+    // ---------------------------------------------------------------------
+    // ACT: execute close and snapshot pool liquidity movement
+    // ---------------------------------------------------------------------
 
     // Snapshot pool liquidity before close
     let (pool_long_before, pool_short_before) = env.executor.state.pool_balances.get_pair_balances(
@@ -335,80 +503,10 @@ fn decrease_full_close_long_profit_fees_and_indices() {
         .checked_sub(fee_pool_before)
         .expect("fee pool bucket must not decrease");
 
-    // Borrowing tokens are always routed to the pool fee bucket in current code path.
-    assert!(
-        delta_fee_pool >= expected_borrowing_tokens,
-        "fee bucket delta must be at least borrowing tokens"
-    );
-
-    let trading_tokens_actual = delta_fee_pool - expected_borrowing_tokens;
-
-    // Infer effective bps from actual trading tokens and verify against configured fee schedule.
-    // trading_fee_usd = trading_tokens * collateral_price_min
-    let trading_fee_usd_actual = trading_tokens_actual * prices.collateral_price_min;
-
-    // effective_bps = trading_fee_usd * 10_000 / size_delta_usd
-    let effective_bps_actual = mul_div_u256(
-        trading_fee_usd_actual,
-        U256::from(10_000u32),
-        pos_before.size_usd,
-    )
-    .unwrap();
-
-    // For now we assume "helpful rebate applies when trade reduces imbalance".
-    // In long-heavy market, decreasing a long should be helpful => apply rebate.
-    let mut expected_bps = DECREASE_FEE_BPS;
-
-    // Trading fee (independent): determine whether decrease is "helpful" by imbalance reduction
-    let skew_before = u256_abs_diff(m_before.oi_long_usd, m_before.oi_short_usd);
-    let long_after = m_before
-        .oi_long_usd
-        .checked_sub(pos_before.size_usd)
-        .expect("oi_long underflow");
-    let skew_after = u256_abs_diff(long_after, m_before.oi_short_usd);
-
-    let decrease_is_helpful = skew_after < skew_before;
-
-    if decrease_is_helpful {
-        expected_bps = expected_bps.saturating_mul(100 - HELPFUL_REBATE_PERCENT) / 100;
-    }
-
     assert_eq!(
-        effective_bps_actual,
-        U256::from(expected_bps),
-        "unexpected effective decrease fee bps"
+        delta_fee_pool, expected_fee_pool_delta,
+        "fee bucket delta mismatch"
     );
-
-    let trading_fee_usd = mul_div_u256(
-        pos_before.size_usd,
-        U256::from(expected_bps),
-        U256::from(10_000u32),
-    )
-    .expect("trading fee mul/div");
-
-    let trading_fee_tokens = trading_fee_usd / prices.collateral_price_min;
-
-    // Expected pool fee bucket delta = trading + borrowing (funding is NOT routed to pool in your code)
-    let expected_fee_pool_delta = trading_fee_tokens + expected_borrowing_tokens;
-
-    // Expected profit payout from pool (no impact assumed here)
-    let pnl_usd = calc_long_pnl_usd(
-        pos_before.size_tokens,
-        pos_before.size_usd,
-        prices.index_price_min,
-    );
-    let expected_pnl_tokens = pnl_usd / prices.collateral_price_max;
-
-    // Expected pool fee bucket delta = trading + borrowing (funding is NOT routed to pool in your code)
-    let close_costs_tokens = trading_fee_tokens + expected_borrowing_tokens + funding_cost_tokens;
-
-    assert!(
-        pos_before.collateral_amount >= close_costs_tokens,
-        "position must have enough collateral for close costs in this scenario"
-    );
-
-    let expected_rest_collateral = pos_before.collateral_amount - close_costs_tokens;
-    let expected_user_delta = expected_rest_collateral + expected_pnl_tokens;
 
     // ---------------------------------------------------------------------
     // ASSERT: user received some payout into Claimables::fees (collateral asset)
@@ -423,12 +521,13 @@ fn decrease_full_close_long_profit_fees_and_indices() {
         .checked_sub(user_fee_before)
         .expect("user fee claimable must not decrease");
 
+    assert_eq!(user_delta, expected_user_delta, "user payout mismatch");
     assert!(
         !user_delta.is_zero(),
         "closing should credit some collateral payout into claimables.fees"
     );
 
-    println!("user_delta {:?}", user_delta);
-    println!("pool_paid {:?}", pool_paid);
-    println!("pool_received {:?}", pool_received);
+    assert_eq!(pool_paid, expected_pool_paid, "pool payout mismatch");
+    assert_eq!(pool_received, expected_pool_received, "pool receive mismatch");
+
 }

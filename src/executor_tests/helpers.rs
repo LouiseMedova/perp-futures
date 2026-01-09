@@ -4,7 +4,8 @@ use crate::{
     services::BasicServicesBundle,
     state::{MarketState, PositionKey, State},
     types::{
-        AccountId, AssetId, MarketId, OraclePrices, Order, OrderId, OrderType, Side, Timestamp,
+        AccountId, AssetId, MarketId, OraclePrices, Order, OrderId, OrderType, Side, SignedU256,
+        Timestamp,
     },
 };
 use primitive_types::{U256, U512};
@@ -379,4 +380,32 @@ fn u512_to_u256_checked(x: U512) -> Result<U256, String> {
 
 pub fn u256_abs_diff(a: U256, b: U256) -> U256 {
     if a >= b { a - b } else { b - a }
+}
+
+/// Convert signed impact tokens -> signed USD, conservative:
+/// +tokens => * index_price_min
+/// -tokens => * index_price_max
+pub fn impact_tokens_to_usd_conservative(
+    tokens: SignedU256,
+    prices: &OraclePrices,
+) -> Result<SignedU256, String> {
+    if tokens.is_zero() {
+        return Ok(SignedU256::zero());
+    }
+    let px = if tokens.is_negative {
+        prices.index_price_max
+    } else {
+        prices.index_price_min
+    };
+    if px.is_zero() {
+        return Err("invalid_index_price_for_pending_impact".into());
+    }
+    let mag = tokens
+        .mag
+        .checked_mul(px)
+        .ok_or("pending_impact_usd_overflow")?;
+    Ok(SignedU256 {
+        is_negative: tokens.is_negative,
+        mag,
+    })
 }

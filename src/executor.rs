@@ -497,6 +497,7 @@ impl<S: ServicesBundle, O: Oracle> Executor<S, O> {
                 return Err(format!("insufficient_collateral_for_costs:{e}"));
             }
 
+            println!("COLL AMOUNT {:?}", pos.collateral_amount);
             // Route fees to pool / claimables.
             services
                 .fees()
@@ -521,7 +522,9 @@ impl<S: ServicesBundle, O: Oracle> Executor<S, O> {
             // Realize pending impact to signed USD (conservative)
             let realized_pending_impact_usd: SignedU256 =
                 impact_tokens_to_usd_conservative(pending_impact_realized_tokens, prices)?;
-           
+
+            println!("REALISED BASE PNL {:?}", realized_base_pnl_usd);
+            println!("REALISED BASE PNL {:?}", realized_pending_impact_usd);
             // Include close price impact
             let realized_total_usd: SignedU256 = math::signed_add(
                 math::signed_add(realized_base_pnl_usd, realized_pending_impact_usd),
@@ -534,6 +537,7 @@ impl<S: ServicesBundle, O: Oracle> Executor<S, O> {
             let pnl_tokens_signed: SignedU256 =
                 math::pnl::pnl_usd_to_collateral_tokens(realized_total_usd, prices)?;
 
+            println!("PNL {:?}", pnl_tokens_signed);
             let collateral_asset = pos.key.collateral_token;
             let mut output_tokens: TokenAmount = U256::zero();
 

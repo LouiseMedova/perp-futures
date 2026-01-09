@@ -127,10 +127,7 @@ impl PricingService for BasicPricingService {
         //
         // (Increase, Long) | (Decrease, Short): use indexPrice.max, floor
         // (Increase, Short)| (Decrease, Long) : use indexPrice.min, ceil
-        println!("size_delta_usd {:?}", size_delta_usd);
-        println!("index_price_min {:?}", prices.index_price_min);
-        println!("index_price_max {:?}", prices.index_price_max);
-        println!("price_impact_usd {:?}", price_impact_usd);
+
         let base_size_delta_tokens: TokenAmount =
             match (direction, side) {
                 (TradeDirection::Increase, Side::Long)
